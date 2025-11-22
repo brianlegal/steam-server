@@ -3,15 +3,24 @@ const fs = require('fs');
 const cors = require('cors');
 const { Client, GatewayIntentBits, Partials } = require('discord.js');
 
-// --- CONFIGURAÇÃO DO SERVIDOR ---
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 const DB_FILE = 'database.json';
 
+// Estrutura do Banco:
+// {
+//   "activation_keys": ["KEY-123", "KEY-456"],
+//   "users": {
+//     "steam_nick_do_cara": { "files": [ {url, filename} ] }
+//   }
+// }
+
 function lerBanco() {
-    if (!fs.existsSync(DB_FILE)) fs.writeFileSync(DB_FILE, JSON.stringify([]));
+    if (!fs.existsSync(DB_FILE)) {
+        fs.writeFileSync(DB_FILE, JSON.stringify({ activation_keys: [], users: {} }));
+    }
     return JSON.parse(fs.readFileSync(DB_FILE));
 }
 
@@ -19,95 +28,144 @@ function salvarBanco(data) {
     fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2));
 }
 
-// --- ROTAS DO SITE (Mantidas para o Python funcionar) ---
-app.post('/add-key', (req, res) => {
-    const { key, url, filename } = req.body;
-    let db = lerBanco();
-    if (db.find(item => item.key === key)) return res.json({ success: false, message: 'Key já existe!' });
-    db.push({ key, url, filename });
-    salvarBanco(db);
-    res.json({ success: true, message: 'Key vinculada!' });
-});
+// --- API PARA O PYTHON ---
 
-app.get('/get-info/:key', (req, res) => {
-    const key = req.params.key;
+// Rota 1: Verifica se o usuário tem assinatura e retorna os arquivos dele
+app.get('/get-user-library/:steam_nick', (req, res) => {
+    const nick = req.params.steam_nick;
     const db = lerBanco();
-    const entry = db.find(item => item.key === key);
-    if (entry) res.json({ success: true, url: entry.url, filename: entry.filename });
-    else res.status(404).json({ success: false, message: "Key não encontrada" });
+
+    // Verifica se o usuário existe no banco (tem assinatura)
+    if (db.users[nick]) {
+        res.json({ 
+            success: true, 
+            files: db.users[nick].files 
+        });
+    } else {
+        res.json({ 
+            success: false, 
+            message: "Usuário sem assinatura ativa." 
+        });
+    }
 });
 
-// --- CONFIGURAÇÃO DO BOT DISCORD ---
+// --- BOT DISCORD ---
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMessages,
         GatewayIntentBits.MessageContent,
-        GatewayIntentBits.DirectMessages
+        GatewayIntentBits.GuildMembers // Necessário para boas-vindas
     ],
     partials: [Partials.Channel] 
 });
 
-client.on('ready', () => {
-    console.log(`Bot logado como ${client.user.tag}!`);
+// 1. SAUDAÇÃO (Boas-vindas)
+client.on('guildMemberAdd', member => {
+    const channel = member.guild.channels.cache.find(ch => ch.name === 'geral' || ch.name === 'general');
+    if (channel) {
+        channel.send(`👋 Bem-vindo(a) ${member}! Para usar nosso injetor, você precisa de uma **Chave de Ativação**. Fale com o Admin!`);
+    }
 });
 
 client.on('messageCreate', async message => {
-    // Ignora mensagens do próprio bot
     if (message.author.bot) return;
 
-    // COMANDO: !add KEY (com arquivo anexado)
-    if (message.content.startsWith('!add')) {
-        const args = message.content.split(' ');
-        const key = args[1]; // Pega o que vem depois do !add
+    const args = message.content.split(' ');
+    const command = args[0].toLowerCase();
+    const db = lerBanco();
 
-        // Validações
-        if (!key) {
-            return message.reply('❌ **Erro:** Digite a key. Exemplo: `!add VIP1` (e anexe o arquivo).');
+    // --- COMANDOS DO DONO (MASTER) ---
+    
+    // !gerar <quantidade> <senha_mestre>
+    if (command === '!gerar') {
+        const qtd = parseInt(args[1]);
+        const pass = args[2];
+
+        if (pass !== process.env.MASTER_KEY) return message.reply("❌ Senha Mestre incorreta.");
+        if (!qtd || isNaN(qtd)) return message.reply("❌ Diga a quantidade. Ex: `!gerar 5 SENHA`");
+
+        let novasKeys = [];
+        for (let i = 0; i < qtd; i++) {
+            // Gera uma key aleatória (Ex: KEY-A1B2)
+            const key = "KEY-" + Math.random().toString(36).substring(2, 6).toUpperCase();
+            db.activation_keys.push(key);
+            novasKeys.push(key);
         }
+        salvarBanco(db);
+        
+        // Manda na DM do Admin para ninguém roubar
+        message.author.send(`🔑 **Chaves Geradas:**\n${novasKeys.join('\n')}`);
+        return message.reply("✅ Chaves enviadas na sua DM!");
+    }
 
-        if (message.attachments.size === 0) {
-            return message.reply('❌ **Erro:** Você precisa arrastar o arquivo junto com a mensagem!');
-        }
+    // !painel <senha_mestre> (Ver quem assinou)
+    if (command === '!painel') {
+        if (args[1] !== process.env.MASTER_KEY) return message.reply("❌ Acesso negado.");
+        
+        let lista = "**📋 Assinantes Ativos:**\n";
+        const users = Object.keys(db.users);
+        if (users.length === 0) lista += "Ninguém ainda.";
+        
+        users.forEach(u => {
+            lista += `👤 **${u}** - Arquivos: ${db.users[u].files.length}/101\n`;
+        });
+        return message.reply(lista);
+    }
 
-        // Pega o primeiro arquivo enviado
-        const attachment = message.attachments.first();
-        const fileUrl = attachment.url;
-        const fileName = attachment.name;
+    // --- COMANDOS DO CLIENTE ---
 
-        // Salva no Banco de Dados
-        let db = lerBanco();
+    // !ativar <CHAVE> <STEAM_NICK>
+    if (command === '!ativar') {
+        const key = args[1];
+        const nick = args[2];
 
-        if (db.find(item => item.key === key)) {
-            return message.reply(`⚠️ A Key **${key}** já existe! Use outro nome.`);
-        }
+        if (!key || !nick) return message.reply("❌ Uso correto: `!ativar CHAVE SEU_NICK_STEAM`");
 
-        db.push({ key: key, url: fileUrl, filename: fileName });
+        // Verifica se a chave existe
+        const keyIndex = db.activation_keys.indexOf(key);
+        if (keyIndex === -1) return message.reply("❌ Chave inválida ou já usada.");
+
+        // Verifica se o nick já tem conta
+        if (db.users[nick]) return message.reply("⚠️ Esse Nick já possui uma assinatura ativa!");
+
+        // ATIVAÇÃO
+        db.activation_keys.splice(keyIndex, 1); // Remove a chave usada
+        db.users[nick] = { files: [] }; // Cria a conta do usuário
         salvarBanco(db);
 
-        return message.reply(`✅ **Sucesso!**\nArquivo: \`${fileName}\`\nKey: \`${key}\`\n\nJá está funcionando no Launcher! 🚀`);
+        return message.reply(`✅ **Sucesso!** Assinatura ativada para o Steam Nick: **${nick}**.\nAgora você pode enviar arquivos com \`!add\`.`);
     }
 
-    // COMANDO: !list (Para ver as keys criadas)
-    if (message.content === '!list') {
-        const db = lerBanco();
-        if (db.length === 0) return message.reply("Nenhuma key cadastrada.");
+    // !add (Com anexo) - Adiciona na biblioteca do usuário
+    if (command === '!add') {
+        // O usuário precisa dizer o nick dele para confirmar (segurança básica)
+        // Ou idealmente, vincularíamos o ID do Discord ao Nick, mas vamos manter simples:
+        const nick = args[1];
+
+        if (!nick) return message.reply("❌ Diga seu nick. Ex: `!add MEU_NICK` (e anexe o arquivo).");
+        if (!db.users[nick]) return message.reply("❌ Você não tem assinatura ativa para este Nick.");
         
-        let msg = "**Keys Ativas:**\n";
-        db.forEach(item => {
-            msg += `🔑 ${item.key} -> 📄 ${item.filename}\n`;
+        if (message.attachments.size === 0) return message.reply("❌ Anexe o arquivo!");
+
+        const userLib = db.users[nick].files;
+        if (userLib.length >= 101) return message.reply("❌ Limite de 101 arquivos atingido!");
+
+        const attachment = message.attachments.first();
+        
+        // Salva na biblioteca DO USUÁRIO
+        userLib.push({
+            url: attachment.url,
+            filename: attachment.name
         });
-        return message.reply(msg);
+        salvarBanco(db);
+
+        return message.reply(`✅ Arquivo **${attachment.name}** adicionado à biblioteca de **${nick}**! (${userLib.length}/101)`);
     }
 });
 
-// --- INICIALIZAÇÃO ---
 const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Server on ${PORT}`));
 
-// Inicia o Servidor Web
-app.listen(PORT, () => {
-    console.log(`Servidor rodando na porta ${PORT}`);
-});
-// Mude a última linha para ficar EXATAMENTE assim:
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN; 
 client.login(DISCORD_TOKEN);
